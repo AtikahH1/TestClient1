@@ -1,0 +1,252 @@
+name: Sync issues/PRs/push/CI to Leadership Project
+
+on:
+  issues:
+    types: [opened, edited, labeled, unlabeled, closed, reopened]
+  pull_request:
+    types: [opened, edited, labeled, unlabeled, closed, reopened, synchronize]
+  push:
+    # Consider restricting to branches you want (e.g., main). Default: all.
+    branches: [ "**" ]
+  workflow_run:
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  sync-to-project:
+    runs-on: ubuntu-latest
+    env:
+      PROJECT_V2_ID: ${{ secrets.PROJECT_V2_ID }}
+      PROJECT_BOT_TOKEN: ${{ secrets.PROJECT_BOT_TOKEN }}
+      STATUS_FIELD_NAME: ${{ secrets.PROJECT_STATUS_FIELD_NAME || 'Status' }}
+    steps:
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Sync event to Project V2
+        uses: actions/github-script@v7
+        env:
+          PROJECT_V2_ID: ${{ secrets.PROJECT_V2_ID }}
+          PROJECT_BOT_TOKEN: ${{ secrets.PROJECT_BOT_TOKEN }}
+          STATUS_FIELD_NAME: ${{ secrets.PROJECT_STATUS_FIELD_NAME || 'Status' }}
+        with:
+          script: |
+            const token = process.env.PROJECT_BOT_TOKEN;
+            const projectId = process.env.PROJECT_V2_ID;
+            const statusFieldName = process.env.STATUS_FIELD_NAME || 'Status';
+            if (!token) throw new Error("PROJECT_BOT_TOKEN secret is required.");
+            if (!projectId) throw new Error("PROJECT_V2_ID secret is required.");
+
+            const gh = github;
+            const ctx = gh.context;
+            const payload = ctx.payload;
+            const graphqlAuth = (query, vars={}) =>
+              gh.graphql(query, { ...vars, headers: { authorization: `bearer ${token}` } });
+
+            // Helper: find status field id & option id by option label
+            async function findStatusField() {
+              const q = `
+                query($projectId: ID!) {
+                  node(id: $projectId) {
+                    ... on ProjectV2 {
+                      fields(first: 50) {
+                        nodes {
+                          id
+                          name
+                          dataType
+                          ... on ProjectV2SingleSelectField {
+                            settings
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              `;
+              const res = await graphqlAuth(q, { projectId });
+              const fields = res.node.fields.nodes;
+              const statusField = fields.find(f => f.name === statusFieldName && f.dataType === "SINGLE_SELECT");
+              return { fields, statusField };
+            }
+
+            // For Issues / PRs: use content node id to add item by content
+            const contentNodeId = payload.issue?.node_id || payload.pull_request?.node_id;
+
+            // Map common states/labels to single-select option labels (adjust as needed)
+            const stateToOption = {
+              open: "To do",
+              closed: "Done",
+              merged: "Done",
+              in_progress: "In progress",
+              review: "In review"
+            };
+
+            // Add a content-backed item to project
+            async function addContentItem(contentId) {
+              try {
+                const mut = `
+                  mutation($projectId: ID!, $contentId: ID!) {
+                    addProjectV2ItemByContent(input: { projectId: $projectId, contentId: $contentId }) {
+                      item { id }
+                    }
+                  }
+                `;
+                const addRes = await graphqlAuth(mut, { projectId, contentId });
+                core.info(`Added content item: ${addRes.addProjectV2ItemByContent.item.id}`);
+                return addRes.addProjectV2ItemByContent.item.id;
+              } catch (err) {
+                core.info(`addProjectV2ItemByContent failed: ${err.message}`);
+                return null;
+              }
+            }
+
+            // Create a note item (for push or workflow_run)
+            async function createNoteItem(title, body) {
+              const mut = `
+                mutation($projectId: ID!, $title: String, $body: String) {
+                  addProjectV2Item(input: { projectId: $projectId, title: $title, content: { body: $body } }) {
+                    item { id }
+                  }
+                }
+              `;
+              const r = await graphqlAuth(mut, { projectId, title, body });
+              core.info(`Created note item: ${r.addProjectV2Item.item.id}`);
+              return r.addProjectV2Item.item.id;
+            }
+
+            // Update a single-select status field on an item
+            async function updateStatusField(itemId, optionLabel) {
+              const { statusField } = await findStatusField();
+              if (!statusField) {
+                core.info(`Status single-select field '${statusFieldName}' not found in project.`);
+                return;
+              }
+              // parse settings to find option id -> settings is JSON string
+              let options = [];
+              try {
+                options = JSON.parse(statusField.settings).options || [];
+              } catch (e) {
+                core.info("Could not parse single-select settings.");
+              }
+              const opt = options.find(o => o.name === optionLabel);
+              if (!opt) {
+                core.info(`Option '${optionLabel}' not found in field '${statusFieldName}'.`);
+                return;
+              }
+              const updateMut = `
+                mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: ProjectV2ItemFieldValue!) {
+                  updateProjectV2ItemFieldValue(input:{
+                    projectId: $projectId,
+                    itemId: $itemId,
+                    fieldId: $fieldId,
+                    value: $value
+                  }) {
+                    projectV2Item { id }
+                  }
+                }
+              `;
+              const value = { singleSelectOptionId: opt.id };
+              await graphqlAuth(updateMut, { projectId, itemId, fieldId: statusField.id, value });
+              core.info(`Updated status field to '${optionLabel}'`);
+            }
+
+            // Main event handling
+            if (contentNodeId) {
+              // Issue or PR event
+              core.info("Event is an Issue or PR. Trying to add/update content-backed project item.");
+              let itemId = await addContentItem(contentNodeId);
+
+              // If not added because it already exists, find the item in project items (paginated search)
+              if (!itemId) {
+                // search project items (page through first 100)
+                const query = `
+                  query($projectId: ID!, $first: Int!, $after: String) {
+                    node(id: $projectId) {
+                      ... on ProjectV2 {
+                        items(first: $first, after: $after) {
+                          nodes {
+                            id
+                            content {
+                              __typename
+                              ... on Issue { id, databaseId }
+                              ... on PullRequest { id, databaseId }
+                            }
+                          }
+                          pageInfo { hasNextPage endCursor }
+                        }
+                      }
+                    }
+                  }
+                `;
+                let after = null;
+                let found = null;
+                do {
+                  const r = await graphqlAuth(query, { projectId, first: 100, after });
+                  const nodes = r.node.items.nodes;
+                  found = nodes.find(n => n.content && n.content.id === contentNodeId);
+                  after = r.node.items.pageInfo.hasNextPage ? r.node.items.pageInfo.endCursor : null;
+                } while (!found && after);
+                if (found) itemId = found.id;
+                if (!itemId) {
+                  core.info("Could not locate existing project item for content after paging.");
+                } else {
+                  core.info(`Located existing project item ${itemId}`);
+                }
+              }
+
+              // Attempt to update Status based on issue/pr state or labels
+              if (itemId) {
+                let desiredOption = null;
+                if (payload.issue) {
+                  desiredOption = (payload.issue.state === "open") ? stateToOption.open : stateToOption.closed;
+                  // optional: map labels like 'in-progress' to in_progress
+                  if (payload.issue.labels && payload.issue.labels.some(l => l.name && l.name.toLowerCase().includes('in-progress'))) {
+                    desiredOption = stateToOption.in_progress;
+                  }
+                } else if (payload.pull_request) {
+                  const pr = payload.pull_request;
+                  desiredOption = pr.merged ? stateToOption.merged : (pr.state === "open" ? stateToOption.open : stateToOption.closed);
+                  if ((pr.labels || []).some(l => l.name && l.name.toLowerCase().includes('in-progress'))) {
+                    desiredOption = stateToOption.in_progress;
+                  }
+                  if ((pr.requested_reviewers || []).length) {
+                    desiredOption = stateToOption.review;
+                  }
+                }
+                if (desiredOption) {
+                  await updateStatusField(itemId, desiredOption);
+                } else {
+                  core.info("No mapped status to update for this event.");
+                }
+              }
+              return;
+            }
+
+            // Handle push event
+            if (payload.commits) {
+              const p = payload;
+              const headCommit = p.head_commit;
+              const title = `push: ${p.ref.replace('refs/heads/','')} @ ${p.repository.full_name}`;
+              const body = `Commit: ${headCommit.id}\nAuthor: ${headCommit.author.name}\nMessage: ${headCommit.message}\n\nCompare: ${p.compare}`;
+              const item = await createNoteItem(title, body);
+              return;
+            }
+
+            // Handle workflow_run completed (CI)
+            if (payload.workflow_run) {
+              const run = payload.workflow_run;
+              const conclusion = run.conclusion || run.status;
+              const title = `CI: ${run.name} — ${conclusion} — ${run.repository.full_name}`;
+              const body = `Workflow: ${run.html_url}\nStatus: ${conclusion}\nEvent: ${run.event}\nHead branch: ${run.head_branch}\nTriggered by: ${run.actor?.login || 'unknown'}`;
+              const item = await createNoteItem(title, body);
+              return;
+            }
+
+            core.info("Event not processed for sync.");
