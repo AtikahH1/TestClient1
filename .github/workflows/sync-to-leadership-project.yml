@@ -1,0 +1,133 @@
+name: Sync issues & PRs to Leadership Project
+
+on:
+  issues:
+    types: [opened, edited, labeled, unlabeled, closed, reopened]
+  pull_request:
+    types: [opened, edited, labeled, unlabeled, closed, reopened, synchronize]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+  # Note: GITHUB_TOKEN may not have project permissions for org-level Project V2.
+  # We will use PROJECT_BOT_TOKEN (PAT or App token) supplied as a secret.
+
+jobs:
+  sync-to-project:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout (not required, but keeps pattern consistent)
+      uses: actions/checkout@v4
+
+    - name: Install node (for actions/github-script)
+      uses: actions/setup-node@v4
+      with:
+        node-version: 18
+
+    - name: Sync Issue/PR to Project V2
+      uses: actions/github-script@v7
+      env:
+        PROJECT_BOT_TOKEN: ${{ secrets.PROJECT_BOT_TOKEN }}
+        PROJECT_V2_ID: ${{ secrets.PROJECT_V2_ID }}
+      with:
+        script: |
+          const token = process.env.PROJECT_BOT_TOKEN || process.env.GITHUB_TOKEN;
+          if (!token) throw new Error("PROJECT_BOT_TOKEN secret is required.");
+
+          const projectId = process.env.PROJECT_V2_ID;
+          if (!projectId) throw new Error("PROJECT_V2_ID secret is required.");
+
+          // Get event context
+          const context = github.context;
+          const payload = context.payload;
+
+          // Determine content node id (GraphQL node id) for issue or PR
+          const contentNodeId = payload.issue?.node_id || payload.pull_request?.node_id;
+          if (!contentNodeId) {
+            core.info("No issue or pull_request node id found in this event; nothing to sync.");
+            return;
+          }
+
+          // Octokit GraphQL helper
+          const graphqlWithAuth = (query, variables = {}) =>
+            github.graphql(query, { ...variables, headers: { authorization: `bearer ${token}` } });
+
+          // 1) Try to add the issue/PR to the target project via GraphQL mutation
+          try {
+            const addMutation = `
+              mutation($projectId: ID!, $contentId: ID!) {
+                addProjectV2ItemByContent(input: { projectId: $projectId, contentId: $contentId }) {
+                  item { id }
+                }
+              }
+            `;
+            const addRes = await graphqlWithAuth(addMutation, { projectId, contentId: contentNodeId });
+            core.info(`Added to project: ${addRes.addProjectV2ItemByContent.item.id}`);
+            return;
+          } catch (err) {
+            core.info(`addProjectV2ItemByContent failed (maybe item exists): ${err.message}`);
+            // continue to try to find & update existing item
+          }
+
+          // 2) If add failed (likely because item already exists), find the item in the project and update a status field or note if desired.
+          // Fetch first 100 project items. If you have more items, increase pagination logic.
+          const queryItems = `
+            query($projectId: ID!, $first: Int!) {
+              node(id: $projectId) {
+                ... on ProjectV2 {
+                  items(first: $first) {
+                    nodes {
+                      id
+                      content {
+                        __typename
+                        ... on Issue { id }
+                        ... on PullRequest { id }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          `;
+          const itemsRes = await graphqlWithAuth(queryItems, { projectId, first: 100 });
+          const nodes = itemsRes.node.items.nodes;
+
+          const matching = nodes.find(n => n.content && n.content.id === contentNodeId);
+          if (!matching) {
+            core.info("Item not found in first 100 project items. You may need to increase pagination or search differently.");
+            return;
+          }
+          const itemId = matching.id;
+          core.info(`Found existing project item: ${itemId}`);
+
+          // Optional: Update a field on the project item (e.g., a Status field). To do that you need the fieldId.
+          // Replace FIELD_ID and VALUE with your configured project field ID and the appropriate value format.
+          // Example update mutation (single-select field or text) -- adapt to your field type:
+          /*
+          const updateMutation = `
+            mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $value: ProjectV2ItemFieldValue!) {
+              updateProjectV2ItemFieldValue(input: {
+                projectId: $projectId,
+                itemId: $itemId,
+                fieldId: $fieldId,
+                value: $value
+              }) {
+                projectV2Item { id }
+              }
+            }
+          `;
+          // For single select: { singleSelectOptionId: "OPTION_ID" }
+          // For text: { text: "In progress" }
+          await graphqlWithAuth(updateMutation, {
+            projectId,
+            itemId,
+            fieldId: process.env.PROJECT_STATUS_FIELD_ID, // OPTIONAL: set as secret if used
+            value: { text: payload.issue?.state || payload.pull_request?.state || "updated" }
+          });
+          core.info("Updated project field.");
+          */
+
+          // If you do not need to update fields, you may optionally add a comment to the item or just log and return.
+          core.info("Sync complete (no field updates performed).");
